@@ -29,7 +29,7 @@ jobs:
           }
           $cred = [pscredential]::new(".\" + $testName, $pw)
           $payload = @'
-          param([string]$ExpectedSid, [bool]$Install)
+          param([string]$ExpectedSid, [ValidateSet('Probe','Install')][string]$Mode)
           $ErrorActionPreference = 'Stop'
           $result = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'clawd-arm-test.log'
           $log = [Collections.Generic.List[string]]::new()
@@ -47,7 +47,7 @@ jobs:
           $local = [Environment]::GetFolderPath('LocalApplicationData')
           if (!$local -or !(Test-Path -LiteralPath "Registry::HKEY_USERS\$ExpectedSid")) { throw 'Disposable profile not loaded.' }
           $log.Add('Verified native ARM64 and standard-user token with its own loaded profile.')
-          if (!$Install) { exit 0 }
+          if ($Mode -eq 'Probe') { exit 0 }
           $log.Add('Silent installer smoke only; not an in-app updater or interactive desktop reproduction.')
           $scratch = Join-Path $local 'clawd-arm64-upgrade-smoke'
           $install = Join-Path $scratch 'installed'
@@ -106,11 +106,13 @@ jobs:
             if ($result) { [IO.File]::WriteAllLines($result, $log) }
           }
           '@
+          $scriptPath = Join-Path $env:PUBLIC 'Documents\ClawdArmSmoke.ps1'
+          if (Test-Path -LiteralPath $scriptPath) { throw 'Expected a clean synthetic script path.' }
+          [IO.File]::WriteAllText($scriptPath,$payload)
           function Invoke-StandardSmoke([bool]$Install) {
-            $flag = if ($Install) { '$true' } else { '$false' }
-            $code = "& { `n$payload`n } -ExpectedSid '$($test.SID.Value)' -Install $flag"
-            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
-            $child = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $cred -LoadUserProfile -WorkingDirectory $env:windir -ArgumentList "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded" -PassThru
+            $mode = if ($Install) { 'Install' } else { 'Probe' }
+            $argsText = "-NoLogo -NoProfile -NonInteractive -File `"$scriptPath`" -ExpectedSid $($test.SID.Value) -Mode $mode"
+            $child = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $cred -LoadUserProfile -WorkingDirectory $env:windir -ArgumentList $argsText -PassThru
             if (!$child.WaitForExit($(if ($Install) { 550000 } else { 30000 }))) {
               Stop-Process -Id $child.Id -ErrorAction SilentlyContinue
               throw 'Disposable standard-user process timed out.'
@@ -126,5 +128,6 @@ jobs:
             Invoke-StandardSmoke $false
             Invoke-StandardSmoke $true
           } finally {
+            Remove-Item -LiteralPath $scriptPath -ErrorAction SilentlyContinue
             Remove-LocalUser -Name $testName
           }

@@ -1,0 +1,130 @@
+name: Clawd on Desk ARM64 upgrade smoke
+on:
+  push:
+    branches: ['dot-test/clawd-arm64-upgrade-20261121']
+    paths: ['.github/workflows/arm64-upgrade-smoke.yml']
+permissions: {}
+jobs:
+  upgrade:
+    runs-on: windows-11-arm
+    timeout-minutes: 12
+    steps:
+      - name: Verify host and smoke-test official installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+          $processArch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+          Write-Host "OS architecture: $arch; PowerShell architecture: $processArch"
+          if ($arch -ne 'Arm64' -or $processArch -ne 'Arm64') { throw 'Not a native ARM64 test environment' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          if ($identity.IsSystem) { throw 'The runner uses LocalSystem; alternate logon unavailable.' }
+          $testName = 'ClawdArmTest'
+          if (Get-LocalUser -Name $testName -ErrorAction SilentlyContinue) { throw 'Expected a fresh disposable runner.' }
+          $pw = ConvertTo-SecureString "T7!$([Guid]::NewGuid().ToString('N'))" -AsPlainText -Force
+          $test = New-LocalUser -Name $testName -Password $pw -Description 'Disposable standard test account for installer smoke'
+          $standard = Get-LocalGroup -SID 'S-1-5-32-545'
+          if (!(Get-LocalGroupMember -Group $standard.Name | Where-Object SID -eq $test.SID)) {
+            Add-LocalGroupMember -Group $standard.Name -Member $test
+          }
+          $cred = [pscredential]::new(".\" + $testName, $pw)
+          $payload = @'
+          param([string]$ExpectedSid, [bool]$Install)
+          $ErrorActionPreference = 'Stop'
+          $result = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'clawd-arm-test.log'
+          $log = [Collections.Generic.List[string]]::new()
+          try {
+          $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($id)
+          $adminSid = 'S-1-5-32-544'
+          if ($id.User.Value -ne $ExpectedSid) { throw 'Unexpected child account.' }
+          if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'Arm64') { throw 'Child process is not ARM64.' }
+          # The group can remain present as deny-only in an unelevated administrator token.
+          if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or
+              $id.Groups.Value -contains $adminSid) {
+            throw 'Runner is an administrator or uses a split administrator token; standard-user smoke not attempted.'
+          }
+          $local = [Environment]::GetFolderPath('LocalApplicationData')
+          if (!$local -or !(Test-Path -LiteralPath "Registry::HKEY_USERS\$ExpectedSid")) { throw 'Disposable profile not loaded.' }
+          $log.Add('Verified native ARM64 and standard-user token with its own loaded profile.')
+          if (!$Install) { exit 0 }
+          $log.Add('Silent installer smoke only; not an in-app updater or interactive desktop reproduction.')
+          $scratch = Join-Path $local 'clawd-arm64-upgrade-smoke'
+          $install = Join-Path $scratch 'installed'
+          if (Test-Path -LiteralPath $scratch) { throw 'Scratch install location already exists' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          if (Get-Process -Name 'Clawd-on-Desk','Clawd on Desk','clawd_on_desk','clawd-on-desk' -ErrorAction SilentlyContinue) {
+            throw 'An existing Clawd process was found'
+          }
+          $roots = @($local, (Join-Path $local 'Programs'), $env:ProgramFiles, ${env:ProgramFiles(x86)})
+          foreach ($root in $roots | Where-Object { $_ }) {
+            foreach ($name in 'Clawd on Desk','Clawd-on-Desk','clawd_on_desk','ClawdOnDesk') {
+              if (Test-Path -LiteralPath (Join-Path $root $name)) { throw 'An existing Clawd install was found' }
+            }
+          }
+          $versions = @(
+            @{Version='0.14.0'; SHA='0e4d6527603a924394697ccb0648b09c146a5c39f8bd725c481d4bbca0177a42'},
+            @{Version='0.15.0'; SHA='850ba857477d81c9c9a9cd9755c33e474a049be82a34891dd4fbd74e834fa87c'}
+          )
+          foreach ($release in $versions) {
+            $v = $release.Version
+            $asset = "Clawd-on-Desk-Setup-$v-arm64.exe"
+            $exe = Join-Path $scratch $asset
+            Invoke-WebRequest -Uri "https://github.com/rullerzhou-afk/clawd-on-desk/releases/download/v$v/$asset" -OutFile $exe -TimeoutSec 120
+            $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+            if ($sha -ine $release.SHA) { throw "SHA-256 mismatch for $v" }
+            $log.Add("$v SHA-256 verified")
+            $signature = Get-AuthenticodeSignature -LiteralPath $exe
+            $log.Add("$v Authenticode status: $($signature.Status)")
+            if ($signature.Status -notin 'Valid','NotSigned') { throw "Unexpected Authenticode status for $v" }
+            # NSIS /D must be last and is deliberately not quoted, per its command-line convention.
+            $switches = if ($v -eq '0.15.0') { '/S /currentuser --updated --force-run' } else { '/S /currentuser' }
+            $proc = Start-Process -FilePath $exe -ArgumentList "$switches /D=$install" -PassThru
+            if (-not $proc.WaitForExit(150000)) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              throw "$v installer exceeded 150 seconds"
+            }
+            $log.Add("$v installer exit code: $($proc.ExitCode)")
+            if ($proc.ExitCode -ne 0) { throw "$v installer failed" }
+            if (-not (Test-Path -LiteralPath $install)) { throw "$v did not install to the requested scratch directory" }
+            $matching = @(Get-ChildItem -LiteralPath $install -Filter '*.exe' -File | Where-Object {
+              $_.Name -match '^clawd[ _-]*on[ _-]*desk\.exe$'
+            })
+            if ($matching.Count -ne 1) { throw "$v primary executable not uniquely identified in scratch install" }
+            $productVersion = $matching[0].VersionInfo.ProductVersion
+            $fileVersion = $matching[0].VersionInfo.FileVersion
+            if ("$productVersion $fileVersion" -notmatch "(^|\s)$([regex]::Escape($v))(\.|\+|-|\s|$)") {
+              throw "$v not verified in installed executable version metadata"
+            }
+            $log.Add("$v installed executable version verified")
+          }
+          $log.Add('Pass: signed-state-reported, hash-matched installers completed as standard user; executable upgraded 0.14.0 to 0.15.0. In-app updater and launch were not verified.')
+          } catch {
+            $log.Add("Stopped: $($_.Exception.Message)")
+            exit 1
+          } finally {
+            if ($result) { [IO.File]::WriteAllLines($result, $log) }
+          }
+          '@
+          function Invoke-StandardSmoke([bool]$Install) {
+            $flag = if ($Install) { '$true' } else { '$false' }
+            $code = "& { `n$payload`n } -ExpectedSid '$($test.SID.Value)' -Install $flag"
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+            $child = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $cred -LoadUserProfile -WorkingDirectory $env:windir -ArgumentList "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded" -PassThru
+            if (!$child.WaitForExit($(if ($Install) { 550000 } else { 30000 }))) {
+              Stop-Process -Id $child.Id -ErrorAction SilentlyContinue
+              throw 'Disposable standard-user process timed out.'
+            }
+            $profile = Get-CimInstance Win32_UserProfile -Filter ("SID='" + $test.SID.Value + "'")
+            if (!$profile) { throw 'No disposable test user profile found.' }
+            $logPath = Join-Path $profile.LocalPath 'AppData\Local\clawd-arm-test.log'
+            if (!(Test-Path -LiteralPath $logPath)) { throw "No standard-user evidence file; child exit $($child.ExitCode)." }
+            Get-Content -LiteralPath $logPath | Write-Host
+            if ($child.ExitCode -ne 0) { throw "Standard-user smoke stopped (exit $($child.ExitCode))." }
+          }
+          try {
+            Invoke-StandardSmoke $false
+            Invoke-StandardSmoke $true
+          } finally {
+            Remove-LocalUser -Name $testName
+          }

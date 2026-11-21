@@ -22,7 +22,7 @@ jobs:
           $testName = 'ClawdArmTest'
           if (Get-LocalUser -Name $testName -ErrorAction SilentlyContinue) { throw 'Expected a fresh disposable runner.' }
           $pw = ConvertTo-SecureString "T7!$([Guid]::NewGuid().ToString('N'))" -AsPlainText -Force
-          $test = New-LocalUser -Name $testName -Password $pw -Description 'Disposable standard test account for installer smoke'
+          $test = New-LocalUser -Name $testName -Password $pw -Description 'Disposable Clawd smoke-test user'
           $standard = Get-LocalGroup -SID 'S-1-5-32-545'
           if (!(Get-LocalGroupMember -Group $standard.Name | Where-Object SID -eq $test.SID)) {
             Add-LocalGroupMember -Group $standard.Name -Member $test
